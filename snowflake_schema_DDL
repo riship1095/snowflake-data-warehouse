@@ -128,10 +128,10 @@ group by  company_category;
 
 create table datawarehouse.public.vendor_category_comparison as
 select  lower(vc.company_name) company_name,
-        avg_stars_category,
-        category_list,
+        star_rating vendor_rating,
         lower(cr.company_category) company_category,
-        star_rating
+        avg_stars_category average_rating,
+        category_list        
 from vendor_category_rating cr
 join vendor_category vc on vc.company_category = cr.company_category
 join vendors vr on replace(vc.company_name,'"','') = replace(vr.company_name,'"','');
