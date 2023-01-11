@@ -1,0 +1,138 @@
+
+create storage integration s3_int
+  type = external_stage
+  storage_provider = 'S3'
+  enabled = true
+  storage_aws_role_arn = ''
+  storage_allowed_locations = ('s3://raw-data-dw-0410/raw-data/');
+  
+  DESC INTEGRATION s3_int;
+  
+  create database datawarehouse;
+  use database datawarehouse;
+  create role datawarehouse_role;
+  
+  grant create stage on schema public to role datawarehouse_role;
+
+grant usage on integration s3_int to role datawarehouse_role;
+
+use schema datawarehouse.public;
+
+create stage raw_s3_stage
+  storage_integration = s3_int
+  url = 's3://raw-data-dw-0410/raw-data/'
+  file_format = (type=json);
+  
+  
+select * from @raw_s3_stage;
+
+select flat_data.*
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data;
+
+---------------------------------------------------------------------------------------------
+create or replace sequence vendor_seq start = 1 increment = 1; 
+
+create table datawarehouse.public.vendors as     
+select 'C-' || lpad(vendor_seq.nextval,2,'0') as company_id,*
+from (select lower(flat_data.value['input']['company_name']) as company_name,
+        cast(value['number_of_reviews'] as int) as number_of_reviews,
+        cast(value['number_of_stars'] as numeric(38,2)) as star_rating,
+        value['categories_on_g2'] category_list
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data
+  
+Union 
+
+select lower(flat_competitors.value['company_name']),
+        cast(flat_competitors.value['number_of_reviews'] as int) as number_of_reviews,
+        cast(flat_competitors.value['number_of_stars'] as numeric(38,2)) as star_rating,
+        flat_competitors.value['product_category'] category_list
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data,
+      lateral flatten(input=>flat_data.value['top_10_competitors']) flat_competitors)
+      where company_name is not null;
+
+---------------------------------------------------------------------------------------------
+create or replace sequence competitor_seq start = 1 increment = 1; 
+
+create table datawarehouse.public.competitors as       
+select  'P-' || lpad(competitor_seq.nextval,2,'0') competitor_id,*
+from (select distinct lower(flat_competitors.value['competitor_name']) competitor_name,
+        cast(flat_competitors.value['number_of_reviews'] as int) as number_of_reviews,
+        cast(flat_competitors.value['number_of_stars'] as numeric(38,2)) as star_rating
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data,
+      lateral flatten(input=>flat_data.value['top_10_competitors']) flat_competitors);
+      
+----------------------------------------------------------------------------------------------
+  
+  create table datawarehouse.public.vendor_competitors as
+  select v.company_id, p.competitor_id
+  from
+  (select company_id,company_name
+      from datawarehouse.public.vendors) V,
+  (select competitor_id,competitor_name
+  from datawarehouse.public.competitors) P,
+  (select lower(flat_data.value['input']['company_name']) as company_name,
+        lower(flat_competitors.value['competitor_name']) competitor_name
+    from (select $1 json_data 
+          from @raw_s3_stage) src,
+          lateral flatten(input=>src.json_data) flat_data,
+          lateral flatten(input=>flat_data.value['top_10_competitors']) flat_competitors) T
+  where t.company_name = v.company_name
+    and p.competitor_name = t.competitor_name;
+    
+/*select lower(flat_data.value['input']['company_name']) as company_name,
+        lower(flat_competitors.value['competitor_name']) competitor_name,
+        cast(flat_competitors.value['number_of_reviews'] as int) as number_of_reviews,
+        cast(flat_competitors.value['number_of_stars'] as numeric(38,2)) as star_rating
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data,
+      lateral flatten(input=>flat_data.value['top_10_competitors']) flat_competitors;*/
+---------------------------------------------------------------------------------------------      
+      
+create table datawarehouse.public.vendor_category as
+select lower(flat_competitors.value['competitor_name']) as company_name,
+        competitor_category.value as company_category
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data,
+      lateral flatten(input=>flat_data.value['top_10_competitors']) flat_competitors,
+      lateral flatten(input=>flat_competitors.value['product_category']) competitor_category
+  
+Union all
+
+select lower(flat_data.value['input']['company_name']),
+        category_flat.value
+from (select $1 json_data 
+      from @raw_s3_stage) src,
+      lateral flatten(input=>src.json_data) flat_data,
+      lateral flatten(input=>flat_data.value['categories_on_g2']) category_flat;
+---------------------------------------------------------------------------------------------      
+      
+create table datawarehouse.public.vendor_category_rating as
+select company_category,
+        round(sum(v.number_of_reviews*v.star_rating)*1.0/sum(number_of_reviews),1) as avg_stars_category      
+from datawarehouse.public.vendors v
+join datawarehouse.public.vendor_category c
+on v.company_name = c.company_name
+group by  company_category;
+
+---------------------------------------------------------------------------------------------
+
+create table datawarehouse.public.vendor_category_comparison as
+select  lower(vc.company_name) company_name,
+        avg_stars_category,
+        category_list,
+        lower(cr.company_category) company_category,
+        star_rating
+from vendor_category_rating cr
+join vendor_category vc on vc.company_category = cr.company_category
+join vendors vr on replace(vc.company_name,'"','') = replace(vr.company_name,'"','');
+      
